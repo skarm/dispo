@@ -13,7 +13,7 @@ const (
 	defaultFilename = "file"
 
 	filenamePrefix     = `; filename="`
-	filenameStarPrefix = `"; filename*=UTF-8''`
+	filenameStarPrefix = `"; filename*="UTF-8''`
 	filenameOnlySuffix = `"`
 
 	hexUpper = "0123456789ABCDEF"
@@ -50,7 +50,7 @@ func contentDisposition(dispoType, name string) string {
 	var out strings.Builder
 
 	if hasStar {
-		out.Grow(len(dispoType) + len(filenamePrefix) + len(asciiFilename) + len(filenameStarPrefix) + len(encodedFilename))
+		out.Grow(len(dispoType) + len(filenamePrefix) + len(asciiFilename) + len(filenameStarPrefix)*2 + len(encodedFilename))
 	} else {
 		out.Grow(len(dispoType) + len(filenamePrefix) + len(asciiFilename) + len(filenameOnlySuffix))
 	}
@@ -62,6 +62,7 @@ func contentDisposition(dispoType, name string) string {
 	if hasStar {
 		out.WriteString(filenameStarPrefix)
 		out.WriteString(encodedFilename)
+		out.WriteString(filenameOnlySuffix)
 	} else {
 		out.WriteString(filenameOnlySuffix)
 	}
@@ -120,7 +121,7 @@ func buildFilenameParts(name string) (asciiFilename, encodedFilename string, has
 
 		if r <= 0x7e {
 			b := byte(r)
-			if b == '/' || b == '\\' || b == '"' {
+			if b == '/' || b == '\\' || b == '"' || b == '%' {
 				b = '_'
 			}
 			ascii.WriteByte(b)
