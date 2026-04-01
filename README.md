@@ -11,8 +11,8 @@ The package correctly handles:
 * `ContentDisposition(dispositionType, name string) string`
   Generates a Content-Disposition header with the specified type (`inline` or `attachment`) and filename.
 
-* `ContentDispositionForAttachment(name string) string`
+* `Attachment(name string) string`
   Shortcut for `attachment`.
 
-* `ContentDispositionForInline(name string) string`
+* `Inline(name string) string`
   Shortcut for `inline`.
