@@ -1,3 +1,12 @@
+// Package dispo provides helpers to build RFC-compliant Content-Disposition
+// header values (RFC 6266) with support for internationalized filenames
+// using RFC 5987 encoding.
+//
+// The implementation focuses on:
+//   - security (removal of control characters, CRLF injection prevention)
+//   - interoperability (ASCII fallback + filename*)
+//   - performance (minimal allocations)
+//   - strict adherence to RFC 6266 and RFC 5987 where applicable
 package dispo
 
 import (
@@ -10,83 +19,81 @@ const (
 	inline     = "inline"
 	attachment = "attachment"
 
-	defaultFilename = "file"
-
 	filenamePrefix     = `; filename="`
-	filenameStarPrefix = `"; filename*="UTF-8''`
-	filenameOnlySuffix = `"`
+	filenameStarPrefix = `; filename*=UTF-8''`
+	filenameSuffix     = `"`
 
 	hexUpper = "0123456789ABCDEF"
 )
 
-var rfc8187AttrCharTable = buildRFC8187AttrCharTable()
+var rfc5987AttrCharTable = buildRFC5987AttrCharTable()
 
-// ContentDisposition returns a properly formatted Content-Disposition header
-// value for the given disposition type and filename. The dispositionType is
-// normalized to either "inline" or "attachment" according to RFC 6266.
-// The filename is sanitized and encoded if necessary to handle non-ASCII
-// characters.
+// ContentDisposition builds a Content-Disposition header value using the
+// provided disposition type and filename.
+//
+// The dispositionType is normalized to either "inline" or "attachment":
+//   - "inline" (case-insensitive) → "inline"
+//   - any other value → "attachment"
+//
+// The filename is sanitized and encoded according to RFC 6266 and RFC 5987.
+//
+// Behavior details:
+//   - Control characters (unicode.IsControl) are removed.
+//   - Leading and trailing whitespace is trimmed.
+//   - Internal whitespace is preserved.
+//   - Invalid UTF-8 sequences are replaced with the Unicode replacement character '_'.
+//   - If the resulting filename is empty, only the disposition-type is returned
+//     (no filename parameter is emitted).
+//
+// ASCII handling (filename parameter):
+//   - Always emitted when filename is non-empty.
+//   - Encoded as quoted-string.
+//   - Characters `\` and `"` are escaped with backslash as required by RFC 2616.
+//   - Other ASCII characters (including '/', '%', ';', ',') are preserved as-is.
+//
+// Non-ASCII handling:
+//   - Non-ASCII runes are replaced with '_' in the ASCII filename.
+//   - The original UTF-8 filename is emitted via filename* using RFC 5987:
+//     filename*=UTF-8”<percent-encoded UTF-8>
+//
+// Example:
+//
+//	ContentDisposition("attachment", "тест.txt")
+//	  → `attachment; filename="____.txt"; filename*=UTF-8''%D1%82%D0%B5%D1%81%D1%82.txt`
+//
+// Notes:
+//   - filename* is only included if non-ASCII characters are present.
+//   - Spaces in filename* are encoded as %20.
+//   - The function does not enforce filename length limits.
 func ContentDisposition(dispositionType, name string) string {
 	return contentDisposition(normalizeDispositionType(dispositionType), name)
 }
 
-// ContentDispositionForAttachment returns a Content-Disposition header value
-// explicitly set as "attachment" for the given filename. Non-ASCII characters
-// in the filename are percent-encoded following RFC 8187.
-func ContentDispositionForAttachment(name string) string {
+// Attachment is a shorthand for ContentDisposition("attachment", name).
+//
+// See ContentDisposition for full behavior description.
+func Attachment(name string) string {
 	return contentDisposition(attachment, name)
 }
 
-// ContentDispositionForInline returns a Content-Disposition header value
-// explicitly set as "inline" for the given filename. Non-ASCII characters
-// in the filename are percent-encoded following RFC 8187.
-func ContentDispositionForInline(name string) string {
+// Inline is a shorthand for ContentDisposition("inline", name).
+//
+// See ContentDisposition for full behavior description.
+func Inline(name string) string {
 	return contentDisposition(inline, name)
 }
 
 func contentDisposition(dispoType, name string) string {
-	asciiFilename, encodedFilename, hasStar := buildFilenameParts(name)
-
-	var out strings.Builder
-
-	if hasStar {
-		out.Grow(len(dispoType) + len(filenamePrefix) + len(asciiFilename) + len(filenameStarPrefix)*2 + len(encodedFilename))
-	} else {
-		out.Grow(len(dispoType) + len(filenamePrefix) + len(asciiFilename) + len(filenameOnlySuffix))
-	}
-
-	out.WriteString(dispoType)
-	out.WriteString(filenamePrefix)
-	out.WriteString(asciiFilename)
-
-	if hasStar {
-		out.WriteString(filenameStarPrefix)
-		out.WriteString(encodedFilename)
-		out.WriteString(filenameOnlySuffix)
-	} else {
-		out.WriteString(filenameOnlySuffix)
-	}
-
-	return out.String()
-}
-
-func normalizeDispositionType(v string) string {
-	if strings.EqualFold(v, inline) {
-		return inline
-	}
-	return attachment
-}
-
-func buildFilenameParts(name string) (asciiFilename, encodedFilename string, hasStar bool) {
 	if name == "" {
-		return defaultFilename, "", false
+		return dispoType
 	}
 
-	var ascii, encoded strings.Builder
+	var out, encoded strings.Builder
 
-	ascii.Grow(len(name))
-	encoded.Grow(len(name) * 3)
+	out.Grow(len(dispoType) + len(filenamePrefix) + len(name) + len(filenameSuffix) + len(filenameStarPrefix))
+	out.WriteString(dispoType)
 
+	asciiBuf := make([]byte, 0, len(name))
 	hasNonASCII := false
 	written := false
 	pendingSpaces := 0
@@ -100,16 +107,15 @@ func buildFilenameParts(name string) (asciiFilename, encodedFilename string, has
 		}
 
 		if unicode.IsSpace(r) {
-			if !written {
-				continue
+			if written {
+				pendingSpaces++
 			}
-			pendingSpaces++
 			continue
 		}
 
 		if pendingSpaces > 0 {
 			for j := 0; j < pendingSpaces; j++ {
-				ascii.WriteByte(' ')
+				asciiBuf = append(asciiBuf, ' ')
 				if hasNonASCII {
 					appendEncodedByte(&encoded, ' ')
 				}
@@ -119,12 +125,15 @@ func buildFilenameParts(name string) (asciiFilename, encodedFilename string, has
 
 		written = true
 
-		if r <= 0x7e {
+		if r < utf8.RuneSelf {
 			b := byte(r)
-			if b == '/' || b == '\\' || b == '"' || b == '%' {
-				b = '_'
+
+			if b == '"' || b == '\\' {
+				asciiBuf = append(asciiBuf, '\\', b)
+			} else {
+				asciiBuf = append(asciiBuf, b)
 			}
-			ascii.WriteByte(b)
+
 			if hasNonASCII {
 				appendEncodedByte(&encoded, b)
 			}
@@ -133,28 +142,42 @@ func buildFilenameParts(name string) (asciiFilename, encodedFilename string, has
 
 		if !hasNonASCII {
 			hasNonASCII = true
-			for j := 0; j < ascii.Len(); j++ {
-				appendEncodedByte(&encoded, ascii.String()[j])
+			encoded.Grow(len(name) * 3)
+
+			for _, b := range asciiBuf {
+				appendEncodedByte(&encoded, b)
 			}
 		}
 
-		ascii.WriteByte('_')
+		asciiBuf = append(asciiBuf, '_')
 		appendEncodedRune(&encoded, r)
 	}
 
 	if !written {
-		return defaultFilename, "", false
+		return dispoType
 	}
+
+	out.WriteString(filenamePrefix)
+	out.Write(asciiBuf)
+	out.WriteString(filenameSuffix)
 
 	if hasNonASCII {
-		return ascii.String(), encoded.String(), true
+		out.WriteString(filenameStarPrefix)
+		out.WriteString(encoded.String())
 	}
 
-	return ascii.String(), "", false
+	return out.String()
+}
+
+func normalizeDispositionType(v string) string {
+	if strings.EqualFold(v, inline) {
+		return inline
+	}
+	return attachment
 }
 
 func appendEncodedRune(sb *strings.Builder, r rune) {
-	if r <= utf8.RuneSelf-1 {
+	if r < utf8.RuneSelf {
 		appendEncodedByte(sb, byte(r))
 		return
 	}
@@ -167,7 +190,7 @@ func appendEncodedRune(sb *strings.Builder, r rune) {
 }
 
 func appendEncodedByte(sb *strings.Builder, b byte) {
-	if rfc8187AttrCharTable[b] {
+	if rfc5987AttrCharTable[b] {
 		sb.WriteByte(b)
 		return
 	}
@@ -177,7 +200,7 @@ func appendEncodedByte(sb *strings.Builder, b byte) {
 	sb.WriteByte(hexUpper[b&0x0f])
 }
 
-func buildRFC8187AttrCharTable() [256]bool {
+func buildRFC5987AttrCharTable() [256]bool {
 	var table [256]bool
 
 	for b := byte('a'); b <= byte('z'); b++ {
