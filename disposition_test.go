@@ -26,13 +26,15 @@ func TestContentDisposition_FilenameCases(t *testing.T) {
 		{name: "path separators and quote", in: `a/b\c"d.txt`, want: `attachment; filename="a/b\\c\"d.txt"`},
 		{name: "controls removed", in: "ab\x00\x01\r\n\tcd.txt", want: `attachment; filename="abcd.txt"`},
 		{name: "only spaces fallback", in: " \u00A0\u2002 ", want: `attachment`},
-		{name: "empty fallback", want: `attachment`},
+		{name: "empty fallback", in: "", want: `attachment`},
+		{name: "all spaces", in: "    ", want: `attachment`},
 		{name: "percent kept", in: "100%.txt", want: `attachment; filename="100%.txt"`},
 		{name: "percent and others", in: "100%;, ok.txt", want: `attachment; filename="100%;, ok.txt"`},
 		{name: "crlf injection payload", in: "evil\r\nSet-Cookie: hack=1.txt", want: `attachment; filename="evilSet-Cookie: hack=1.txt"`},
 		{name: "invalid utf8 bytes", in: string([]byte{0xff, 0xfe, 'a'}), want: `attachment; filename="__a"; filename*=UTF-8''%EF%BF%BD%EF%BF%BDa`},
 		{name: "ascii prefix + non-ascii + ascii after", in: "abc🔥def.txt", want: `attachment; filename="abc_def.txt"; filename*=UTF-8''abc%F0%9F%94%A5def.txt`},
 		{name: "ascii + spaces + non-ascii", in: "a  🔥b.txt", want: `attachment; filename="a  _b.txt"; filename*=UTF-8''a%20%20%F0%9F%94%A5b.txt`},
+		{name: "ascii word with space before first non-ascii", in: "a b🔥.txt", want: `attachment; filename="a b_.txt"; filename*=UTF-8''a%20b%F0%9F%94%A5.txt`},
 		{name: "only non-ascii", in: "🔥🔥🔥.txt", want: `attachment; filename="___.txt"; filename*=UTF-8''%F0%9F%94%A5%F0%9F%94%A5%F0%9F%94%A5.txt`},
 		{name: "ascii + non-ascii + ascii after", in: "a🔥b.txt", want: `attachment; filename="a_b.txt"; filename*=UTF-8''a%F0%9F%94%A5b.txt`},
 		{name: "chinese characters", in: "你好世界.txt", want: `attachment; filename="____.txt"; filename*=UTF-8''%E4%BD%A0%E5%A5%BD%E4%B8%96%E7%95%8C.txt`},
@@ -226,13 +228,13 @@ func FuzzContentDisposition(f *testing.F) {
 			t.Fatalf("non-deterministic:\n%q\n!=\n%q", out1, out2)
 		}
 
-		dispo, filename, filenameStar, hasFilenameStar := parseContentDisposition(t, out1)
+		disp, filename, filenameStar, hasFilenameStar := parseContentDisposition(t, out1)
 
-		if dispo != "inline" && dispo != "attachment" {
-			t.Fatalf("unexpected disposition: %q", dispo)
+		if disp != "inline" && disp != "attachment" {
+			t.Fatalf("unexpected disposition: %q", disp)
 		}
 
-		assertCommonOutputInvariants(t, out1, dispo, filename, filenameStar, hasFilenameStar)
+		assertCommonOutputInvariants(t, out1, disp, filename, filenameStar, hasFilenameStar)
 	})
 }
 
