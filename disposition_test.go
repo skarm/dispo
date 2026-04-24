@@ -23,13 +23,17 @@ func TestContentDisposition_FilenameCases(t *testing.T) {
 		{name: "trim edges keep inner space", in: "  report 2026.txt  ", want: `attachment; filename="report 2026.txt"`},
 		{name: "unicode letters", in: "Тест.pdf", want: `attachment; filename="____.pdf"; filename*=UTF-8''%D0%A2%D0%B5%D1%81%D1%82.pdf`},
 		{name: "emoji", in: "🔥.txt", want: `attachment; filename="_.txt"; filename*=UTF-8''%F0%9F%94%A5.txt`},
-		{name: "path separators and quote", in: `a/b\c"d.txt`, want: `attachment; filename="a/b\\c\"d.txt"`},
+		{name: "path separators and quote", in: `a/b\c"d.txt`, want: `attachment; filename="a_b_c\"d.txt"; filename*=UTF-8''a%2Fb%5Cc%22d.txt`},
 		{name: "controls removed", in: "ab\x00\x01\r\n\tcd.txt", want: `attachment; filename="abcd.txt"`},
 		{name: "only spaces fallback", in: " \u00A0\u2002 ", want: `attachment`},
 		{name: "empty fallback", in: "", want: `attachment`},
 		{name: "all spaces", in: "    ", want: `attachment`},
 		{name: "percent kept", in: "100%.txt", want: `attachment; filename="100%.txt"`},
 		{name: "percent and others", in: "100%;, ok.txt", want: `attachment; filename="100%;, ok.txt"`},
+		{name: "percent hex escaped in fallback", in: "file%20name.txt", want: `attachment; filename="file_20name.txt"; filename*=UTF-8''file%2520name.txt`},
+		{name: "percent lowercase hex escaped in fallback", in: "file%af.txt", want: `attachment; filename="file_af.txt"; filename*=UTF-8''file%25af.txt`},
+		{name: "percent hazard formed after control removal", in: "file%\r\n41.txt", want: `attachment; filename="file_41.txt"; filename*=UTF-8''file%2541.txt`},
+		{name: "percent hazard formed after nul removal", in: "file%\x0041.txt", want: `attachment; filename="file_41.txt"; filename*=UTF-8''file%2541.txt`},
 		{name: "crlf injection payload", in: "evil\r\nSet-Cookie: hack=1.txt", want: `attachment; filename="evilSet-Cookie: hack=1.txt"`},
 		{name: "invalid utf8 bytes", in: string([]byte{0xff, 0xfe, 'a'}), want: `attachment; filename="__a"; filename*=UTF-8''%EF%BF%BD%EF%BF%BDa`},
 		{name: "ascii prefix + non-ascii + ascii after", in: "abc🔥def.txt", want: `attachment; filename="abc_def.txt"; filename*=UTF-8''abc%F0%9F%94%A5def.txt`},
@@ -43,16 +47,18 @@ func TestContentDisposition_FilenameCases(t *testing.T) {
 		{name: "hebrew letters", in: "שלום.doc", want: `attachment; filename="____.doc"; filename*=UTF-8''%D7%A9%D7%9C%D7%95%D7%9D.doc`},
 		{name: "symbols and math", in: "∑∆√≈.txt", want: `attachment; filename="____.txt"; filename*=UTF-8''%E2%88%91%E2%88%86%E2%88%9A%E2%89%88.txt`},
 		{name: "mixing emojis and CJK", in: "🔥你好.txt", want: `attachment; filename="___.txt"; filename*=UTF-8''%F0%9F%94%A5%E4%BD%A0%E5%A5%BD.txt`},
-		{name: "slash only", in: "a/b", want: `attachment; filename="a/b"`},
-		{name: "backslash only", in: `a\b`, want: `attachment; filename="a\\b"`},
+		{name: "slash only", in: "a/b", want: `attachment; filename="a_b"; filename*=UTF-8''a%2Fb`},
+		{name: "backslash only", in: `a\b`, want: `attachment; filename="a_b"; filename*=UTF-8''a%5Cb`},
 		{name: "quote only", in: `a"b`, want: `attachment; filename="a\"b"`},
 		{name: "percent only", in: "a%b", want: `attachment; filename="a%b"`},
 		{name: "apostrophe", in: "it's.txt", want: `attachment; filename="it's.txt"`},
 		{name: "asterisk", in: "file*.txt", want: `attachment; filename="file*.txt"`},
 		{name: "percent + unicode", in: "100%🔥.txt", want: `attachment; filename="100%_.txt"; filename*=UTF-8''100%25%F0%9F%94%A5.txt`},
+		{name: "double extension", in: "archive.tar.gz", want: `attachment; filename="archive.tar.gz"`},
 		{name: "brackets", in: "file[1].txt", want: `attachment; filename="file[1].txt"`},
 		{name: "angle brackets", in: "file<1>.txt", want: `attachment; filename="file<1>.txt"`},
 		{name: "equals", in: "a=b.txt", want: `attachment; filename="a=b.txt"`},
+		{name: "controls only become empty", in: "\x00\x01\r\n\x7f", want: `attachment`},
 	}
 
 	for _, tt := range tests {
@@ -81,9 +87,12 @@ func TestContentDisposition_TypeNormalization(t *testing.T) {
 	}{
 		{"inline lowercase", "inline", `inline; filename="file.txt"`},
 		{"inline uppercase", "INLINE", `inline; filename="file.txt"`},
-		{"inline with extra spaces", "  \tInLiNe\n", `attachment; filename="file.txt"`},
+		{"inline with extra spaces", "  \tInLiNe\n", `inline; filename="file.txt"`},
 		{"attachment explicit", "attachment", `attachment; filename="file.txt"`},
-		{"unknown", "form-data", `attachment; filename="file.txt"`},
+		{"attachment with extra spaces", " \tattachment\r\n", `attachment; filename="file.txt"`},
+		{"extension token", "form-data", `form-data; filename="file.txt"`},
+		{"extension token normalized to lowercase", "X-Download", `x-download; filename="file.txt"`},
+		{"invalid token fallback", "bad token", `attachment; filename="file.txt"`},
 		{"empty", "", `attachment; filename="file.txt"`},
 	}
 
@@ -160,7 +169,7 @@ func TestContentDisposition_InvariantsOnManyInputs(t *testing.T) {
 
 			disposition, filename, filenameStar, hasFilenameStar := parseContentDisposition(t, out1)
 
-			if disposition != "inline" && disposition != "attachment" {
+			if !isHTTPDispositionToken(disposition) {
 				t.Fatalf("bad disposition %q", disposition)
 			}
 
@@ -170,17 +179,25 @@ func TestContentDisposition_InvariantsOnManyInputs(t *testing.T) {
 }
 
 func TestContentDisposition_UTF8RoundTrip(t *testing.T) {
-	cases := []string{
-		"Тест.pdf",
-		"🔥.txt",
-		"abc🔥def.txt",
-		"你好世界.txt",
-		"漢字かな混在.pdf",
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "unicode letters", in: "Тест.pdf", want: "Тест.pdf"},
+		{name: "emoji", in: "🔥.txt", want: "🔥.txt"},
+		{name: "mixed unicode", in: "abc🔥def.txt", want: "abc🔥def.txt"},
+		{name: "cjk", in: "你好世界.txt", want: "你好世界.txt"},
+		{name: "kanji kana", in: "漢字かな混在.pdf", want: "漢字かな混在.pdf"},
+		{name: "ascii with separators", in: `a/b\c"d.txt`, want: `a/b\c"d.txt`},
+		{name: "ascii percent hazard", in: "file%20name.txt", want: "file%20name.txt"},
+		{name: "ascii lowercase hex hazard", in: "file%af.txt", want: "file%af.txt"},
+		{name: "sanitized percent hazard", in: "file%\r\n41.txt", want: "file%41.txt"},
 	}
 
-	for _, original := range cases {
-		t.Run(original, func(t *testing.T) {
-			header := dispo.Attachment(original)
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			header := dispo.Attachment(tt.in)
 
 			start := strings.Index(header, testFilenameStarPrefix)
 			if start < 0 {
@@ -193,10 +210,19 @@ func TestContentDisposition_UTF8RoundTrip(t *testing.T) {
 				t.Fatalf("failed to percent-decode filename*: %v", err)
 			}
 
-			if decoded != original {
-				t.Fatalf("UTF-8 roundtrip failed: want=%q got=%q", original, decoded)
+			if decoded != tt.want {
+				t.Fatalf("UTF-8 roundtrip failed: want=%q got=%q", tt.want, decoded)
 			}
 		})
+	}
+}
+
+func TestContentDisposition_LongFilename(t *testing.T) {
+	in := strings.Repeat("a", 4096) + ".tar.gz"
+	want := `attachment; filename="` + in + `"`
+
+	if got := dispo.Attachment(in); got != want {
+		t.Fatalf("mismatch:\nwant=%q\ngot =%q", want, got)
 	}
 }
 
@@ -230,7 +256,7 @@ func FuzzContentDisposition(f *testing.F) {
 
 		disp, filename, filenameStar, hasFilenameStar := parseContentDisposition(t, out1)
 
-		if disp != "inline" && disp != "attachment" {
+		if !isHTTPDispositionToken(disp) {
 			t.Fatalf("unexpected disposition: %q", disp)
 		}
 
@@ -307,6 +333,12 @@ func assertCommonOutputInvariants(t *testing.T, out, disposition, filename, file
 
 	if !hasQuotedStringSafety(filename) {
 		t.Fatalf("unsafe quoted filename content: %q", filename)
+	}
+	if strings.Contains(filename, "/") {
+		t.Fatalf("legacy-unsafe slash in filename fallback: %q", filename)
+	}
+	if hasRFC6266PercentHazard(filename) {
+		t.Fatalf("legacy-unsafe percent escape pattern in filename fallback: %q", filename)
 	}
 
 	if hasFilenameStar {
@@ -388,4 +420,33 @@ func isRFC5987AttrChar(b byte) bool {
 
 func isHex(b byte) bool {
 	return (b >= '0' && b <= '9') || (b >= 'A' && b <= 'F') || (b >= 'a' && b <= 'f')
+}
+
+func hasRFC6266PercentHazard(s string) bool {
+	for i := 0; i+2 < len(s); i++ {
+		if s[i] == '%' && isHex(s[i+1]) && isHex(s[i+2]) {
+			return true
+		}
+	}
+	return false
+}
+
+func isHTTPDispositionToken(s string) bool {
+	if s == "" {
+		return false
+	}
+
+	for i := 0; i < len(s); i++ {
+		b := s[i]
+		if b <= 0x20 || b >= 0x7f {
+			return false
+		}
+
+		switch b {
+		case '(', ')', '<', '>', '@', ',', ';', ':', '\\', '"', '/', '[', ']', '?', '=', '{', '}':
+			return false
+		}
+	}
+
+	return true
 }

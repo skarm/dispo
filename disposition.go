@@ -10,6 +10,7 @@
 package dispo
 
 import (
+	"net/textproto"
 	"strings"
 	"unicode"
 	"unicode/utf8"
@@ -23,19 +24,25 @@ const (
 	filenameStarPrefix = `; filename*=UTF-8''`
 	filenameSuffix     = `"`
 
-	hexUpper = "0123456789ABCDEF"
+	httpTokenSeparators = `()<>@,;:\"/[]?={} `
+	hexUpper            = "0123456789ABCDEF"
+	asciiScratchSize    = 256
+	encodedScratchSize  = 512
 )
 
 var rfc5987AttrCharTable = buildRFC5987AttrCharTable()
-var asciiSpace = [256]uint8{'\t': 1, '\n': 1, '\v': 1, '\f': 1, '\r': 1, ' ': 1}
-var quotedStringEscape = [256]uint8{'"': 1, '\\': 1}
+var httpTokenCharTable = buildHTTPTokenCharTable()
+var asciiSpaceTable = [256]uint8{'\t': 1, '\n': 1, '\v': 1, '\f': 1, '\r': 1, ' ': 1}
+var quotedPairEscapeTable = [256]uint8{'"': 1, '\\': 1}
 
 // ContentDisposition builds a Content-Disposition header value using the
 // provided disposition type and filename.
 //
-// The dispositionType is normalized to either "inline" or "attachment":
-//   - "inline" (case-insensitive) -> "inline"
-//   - any other value -> "attachment"
+// The dispositionType is normalized as follows:
+//   - surrounding HTTP whitespace is trimmed
+//   - "inline" and "attachment" (case-insensitive) are normalized to lowercase
+//   - any other valid HTTP token is returned in lowercase
+//   - invalid or empty values fall back to "attachment"
 //
 // The filename is sanitized and encoded according to RFC 6266 and RFC 5987.
 //
@@ -43,22 +50,25 @@ var quotedStringEscape = [256]uint8{'"': 1, '\\': 1}
 //   - Control characters are removed.
 //   - Leading and trailing whitespace is trimmed.
 //   - Internal ASCII and Unicode whitespace is normalized to ASCII spaces.
-//   - Invalid UTF-8 sequences are replaced with the Unicode replacement character '_'.
+//   - Invalid UTF-8 byte sequences become '_' in filename and U+FFFD in filename*.
 //   - If the resulting filename is empty, only the disposition-type is returned.
 //
 // ASCII handling (filename parameter):
 //   - Always emitted when filename is non-empty.
 //   - Encoded as quoted-string.
-//   - Characters `\` and `"` are escaped with backslash as required by RFC 2616.
-//   - Other ASCII characters (including '/', '%', ';', ',') are preserved as-is.
+//   - The fallback avoids `\`, `/`, and `%HH` sequences per RFC 6266 guidance.
+//   - `"` is escaped with backslash in the quoted-string form.
+//   - Other printable ASCII characters are preserved as-is.
 //
 // Non-ASCII handling:
 //   - Non-ASCII runes are replaced with '_' in the ASCII filename.
-//   - The original UTF-8 filename is emitted via filename* using RFC 5987:
-//     filename*=UTF-8”<percent-encoded UTF-8>
+//   - The exact sanitized filename is emitted via filename* using RFC 5987
+//     ext-value syntax with UTF-8, an empty language tag, and percent-encoded
+//     UTF-8 bytes.
 //
 // Notes:
-//   - filename* is only included if non-ASCII characters are present.
+//   - filename* is included when the ASCII fallback cannot represent the
+//     sanitized filename faithfully.
 //   - Spaces in filename* are encoded as %20.
 //   - The function does not enforce filename length limits.
 func ContentDisposition(dispositionType, name string) string {
@@ -84,42 +94,74 @@ func contentDisposition(dispoType, name string) string {
 		return dispoType
 	}
 
-	var out, encodedBuf strings.Builder
+	if out, ok := trySimpleASCIIContentDisposition(dispoType, name); ok {
+		return out
+	}
+
+	var (
+		out strings.Builder
+		// Tuned scratch capacities keep the common slow path on stack-backed slices
+		// and avoid extra heap work for short and medium filenames.
+		asciiScratch   [asciiScratchSize]byte
+		encodedScratch [encodedScratchSize]byte
+	)
 
 	out.Grow(len(dispoType) + len(filenamePrefix) + len(name) + len(filenameSuffix) + len(filenameStarPrefix))
 	out.WriteString(dispoType)
 
-	asciiBuf := make([]byte, 0, len(name))
-	hasNonASCII := false
+	asciiBuf := asciiScratch[:0]
+	if len(name)*2 > cap(asciiBuf) {
+		asciiBuf = make([]byte, 0, len(name)*2)
+	}
+
+	encodedBuf := encodedScratch[:0]
+	hasFilenameStar := false
 	hasContent := false
 	pendingSpaces := 0
 
 	for i := 0; i < len(name); {
 		if b := name[i]; b < utf8.RuneSelf {
+			idx := i
 			i++
 
 			if isASCIIControl(b) {
 				continue
 			}
-			if asciiSpace[b] != 0 {
+			if asciiSpaceTable[b] != 0 {
 				if hasContent {
 					pendingSpaces++
 				}
 				continue
 			}
 
-			if hasNonASCII {
-				asciiBuf = flushPendingSpacesBoth(asciiBuf, &encodedBuf, pendingSpaces)
+			if hasFilenameStar {
+				asciiBuf, encodedBuf = appendPendingSpacesToBoth(asciiBuf, encodedBuf, pendingSpaces)
 			} else {
-				asciiBuf = flushPendingSpacesASCII(asciiBuf, pendingSpaces)
+				asciiBuf = appendPendingASCIISpaces(asciiBuf, pendingSpaces)
 			}
 
 			pendingSpaces = 0
 			hasContent = true
-			asciiBuf = appendQuotedASCIIByte(asciiBuf, b)
 
-			if hasNonASCII {
-				appendEncodedByte(&encodedBuf, b)
+			if isASCIIFallbackUnsafeByte(name, idx, b) {
+				if !hasFilenameStar {
+					out.Grow(len(filenameStarPrefix) + len(name)*3)
+					if len(name)*3 > cap(encodedBuf) {
+						encodedBuf = make([]byte, 0, len(name)*3)
+					}
+					encodedBuf = appendRFC5987EncodedASCII(encodedBuf, name[:idx])
+					hasFilenameStar = true
+				}
+
+				asciiBuf = append(asciiBuf, '_')
+				encodedBuf = appendRFC5987EncodedByte(encodedBuf, b)
+				continue
+			}
+
+			asciiBuf = appendQuotedStringByte(asciiBuf, b)
+
+			if hasFilenameStar {
+				encodedBuf = appendRFC5987EncodedByte(encodedBuf, b)
 			}
 
 			continue
@@ -139,74 +181,163 @@ func contentDisposition(dispoType, name string) string {
 			continue
 		}
 
-		if !hasNonASCII {
-			encodedBuf.Grow(len(name) * 3)
-			appendEncodedSanitizedASCIIPrefix(&encodedBuf, name[:i-size])
-			for range pendingSpaces {
-				appendEncodedByte(&encodedBuf, ' ')
+		if !hasFilenameStar {
+			out.Grow(len(filenameStarPrefix) + len(name)*3)
+			if len(name)*3 > cap(encodedBuf) {
+				encodedBuf = make([]byte, 0, len(name)*3)
 			}
-			asciiBuf = flushPendingSpacesASCII(asciiBuf, pendingSpaces)
-			hasNonASCII = true
+			encodedBuf = appendRFC5987EncodedASCII(encodedBuf, name[:i-size])
+			for range pendingSpaces {
+				encodedBuf = appendRFC5987EncodedByte(encodedBuf, ' ')
+			}
+			asciiBuf = appendPendingASCIISpaces(asciiBuf, pendingSpaces)
+			hasFilenameStar = true
 		} else {
-			asciiBuf = flushPendingSpacesBoth(asciiBuf, &encodedBuf, pendingSpaces)
+			asciiBuf, encodedBuf = appendPendingSpacesToBoth(asciiBuf, encodedBuf, pendingSpaces)
 		}
 
 		pendingSpaces = 0
 		hasContent = true
 		asciiBuf = append(asciiBuf, '_')
-		appendEncodedRune(&encodedBuf, r)
+		encodedBuf = appendRFC5987EncodedRune(encodedBuf, r)
 	}
 
 	if !hasContent {
 		return dispoType
 	}
 
+	if !hasFilenameStar && rewriteRFC6266PercentHazards(asciiBuf) {
+		out.Grow(len(filenameStarPrefix) + len(name)*3)
+		if len(name)*3 > cap(encodedBuf) {
+			encodedBuf = make([]byte, 0, len(name)*3)
+		}
+		encodedBuf = appendRFC5987EncodedASCII(encodedBuf, name)
+		hasFilenameStar = true
+	}
+
 	out.WriteString(filenamePrefix)
 	out.Write(asciiBuf)
 	out.WriteString(filenameSuffix)
 
-	if hasNonASCII {
+	if hasFilenameStar {
 		out.WriteString(filenameStarPrefix)
-		out.WriteString(encodedBuf.String())
+		out.Write(encodedBuf)
 	}
 
 	return out.String()
 }
 
-func normalizeDispositionType(v string) string {
-	if strings.EqualFold(v, inline) {
-		return inline
+func trySimpleASCIIContentDisposition(dispoType, name string) (string, bool) {
+	if name == "" {
+		return dispoType, true
 	}
-	return attachment
+
+	for i := 0; i < len(name); i++ {
+		b := name[i]
+
+		if b == ' ' {
+			if i == 0 || i == len(name)-1 {
+				return "", false
+			}
+			continue
+		}
+
+		switch {
+		case b >= utf8.RuneSelf:
+			return "", false
+		case isASCIIControl(b):
+			return "", false
+		case b == '"' || b == '\\' || b == '/':
+			return "", false
+		case b == '%' && i+2 < len(name) && isHex(name[i+1]) && isHex(name[i+2]):
+			return "", false
+		}
+	}
+
+	return dispoType + filenamePrefix + name + filenameSuffix, true
+}
+
+func normalizeDispositionType(v string) string {
+	v = textproto.TrimString(v)
+	if !isHTTPToken(v) {
+		return attachment
+	}
+
+	switch {
+	case strings.EqualFold(v, inline):
+		return inline
+	case strings.EqualFold(v, attachment):
+		return attachment
+	default:
+		return strings.ToLower(v)
+	}
 }
 
 func isASCIIControl(b byte) bool {
 	return b < 0x20 || b == 0x7f
 }
 
-func flushPendingSpacesASCII(asciiBuf []byte, pendingSpaces int) []byte {
+func isHex(b byte) bool {
+	return (b >= '0' && b <= '9') || (b >= 'A' && b <= 'F') || (b >= 'a' && b <= 'f')
+}
+
+func isHTTPToken(s string) bool {
+	if s == "" {
+		return false
+	}
+
+	for i := 0; i < len(s); i++ {
+		if !httpTokenCharTable[s[i]] {
+			return false
+		}
+	}
+
+	return true
+}
+
+func appendPendingASCIISpaces(asciiBuf []byte, pendingSpaces int) []byte {
 	for range pendingSpaces {
 		asciiBuf = append(asciiBuf, ' ')
 	}
 	return asciiBuf
 }
 
-func flushPendingSpacesBoth(asciiBuf []byte, encoded *strings.Builder, pendingSpaces int) []byte {
+func appendPendingSpacesToBoth(asciiBuf, encodedBuf []byte, pendingSpaces int) ([]byte, []byte) {
 	for range pendingSpaces {
 		asciiBuf = append(asciiBuf, ' ')
-		appendEncodedByte(encoded, ' ')
+		encodedBuf = appendRFC5987EncodedByte(encodedBuf, ' ')
 	}
-	return asciiBuf
+	return asciiBuf, encodedBuf
 }
 
-func appendQuotedASCIIByte(asciiBuf []byte, b byte) []byte {
-	if quotedStringEscape[b] != 0 {
+func appendQuotedStringByte(asciiBuf []byte, b byte) []byte {
+	if quotedPairEscapeTable[b] != 0 {
 		return append(asciiBuf, '\\', b)
 	}
 	return append(asciiBuf, b)
 }
 
-func appendEncodedSanitizedASCIIPrefix(sb *strings.Builder, s string) {
+func isASCIIFallbackUnsafeByte(name string, i int, b byte) bool {
+	if b == '/' || b == '\\' {
+		return true
+	}
+	return b == '%' && i+2 < len(name) && isHex(name[i+1]) && isHex(name[i+2])
+}
+
+func rewriteRFC6266PercentHazards(asciiBuf []byte) bool {
+	replaced := false
+
+	for i := 0; i+2 < len(asciiBuf); i++ {
+		if asciiBuf[i] == '%' && isHex(asciiBuf[i+1]) && isHex(asciiBuf[i+2]) {
+			asciiBuf[i] = '_'
+			replaced = true
+		}
+	}
+
+	return replaced
+}
+
+func appendRFC5987EncodedASCII(buf []byte, s string) []byte {
 	written := false
 	pendingSpaces := 0
 
@@ -217,7 +348,7 @@ func appendEncodedSanitizedASCIIPrefix(sb *strings.Builder, s string) {
 			continue
 		}
 
-		if asciiSpace[b] != 0 {
+		if asciiSpaceTable[b] != 0 {
 			if written {
 				pendingSpaces++
 			}
@@ -225,33 +356,33 @@ func appendEncodedSanitizedASCIIPrefix(sb *strings.Builder, s string) {
 		}
 
 		for range pendingSpaces {
-			appendEncodedByte(sb, ' ')
+			buf = appendRFC5987EncodedByte(buf, ' ')
 		}
 
 		pendingSpaces = 0
 		written = true
-		appendEncodedByte(sb, b)
+		buf = appendRFC5987EncodedByte(buf, b)
 	}
+
+	return buf
 }
 
-func appendEncodedRune(sb *strings.Builder, r rune) {
-	var buf [utf8.UTFMax]byte
+func appendRFC5987EncodedRune(encodedBuf []byte, r rune) []byte {
+	var runeBuf [utf8.UTFMax]byte
 
-	n := utf8.EncodeRune(buf[:], r)
+	n := utf8.EncodeRune(runeBuf[:], r)
 	for i := 0; i < n; i++ {
-		appendEncodedByte(sb, buf[i])
+		encodedBuf = appendRFC5987EncodedByte(encodedBuf, runeBuf[i])
 	}
+
+	return encodedBuf
 }
 
-func appendEncodedByte(sb *strings.Builder, b byte) {
+func appendRFC5987EncodedByte(buf []byte, b byte) []byte {
 	if rfc5987AttrCharTable[b] {
-		sb.WriteByte(b)
-		return
+		return append(buf, b)
 	}
-
-	sb.WriteByte('%')
-	sb.WriteByte(hexUpper[b>>4])
-	sb.WriteByte(hexUpper[b&0x0f])
+	return append(buf, '%', hexUpper[b>>4], hexUpper[b&0x0f])
 }
 
 func buildRFC5987AttrCharTable() [256]bool {
@@ -268,6 +399,20 @@ func buildRFC5987AttrCharTable() [256]bool {
 	}
 	for i := 0; i < len("!#$&+-.^_`|~"); i++ {
 		table["!#$&+-.^_`|~"[i]] = true
+	}
+
+	return table
+}
+
+func buildHTTPTokenCharTable() [256]bool {
+	var table [256]bool
+
+	for b := byte(0x21); b < 0x7f; b++ {
+		table[b] = true
+	}
+
+	for i := 0; i < len(httpTokenSeparators); i++ {
+		table[httpTokenSeparators[i]] = false
 	}
 
 	return table

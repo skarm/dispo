@@ -10,6 +10,42 @@ import (
 	"github.com/skarm/dispo"
 )
 
+var filenameControlReplacer = strings.NewReplacer(
+	"\x00", "",
+	"\x01", "",
+	"\x02", "",
+	"\x03", "",
+	"\x04", "",
+	"\x05", "",
+	"\x06", "",
+	"\x07", "",
+	"\x08", "",
+	"\x09", " ",
+	"\x0a", " ",
+	"\x0b", " ",
+	"\x0c", " ",
+	"\x0d", " ",
+	"\x0e", "",
+	"\x0f", "",
+	"\x10", "",
+	"\x11", "",
+	"\x12", "",
+	"\x13", "",
+	"\x14", "",
+	"\x15", "",
+	"\x16", "",
+	"\x17", "",
+	"\x18", "",
+	"\x19", "",
+	"\x1a", "",
+	"\x1b", "",
+	"\x1c", "",
+	"\x1d", "",
+	"\x1e", "",
+	"\x1f", "",
+	"\x7f", "",
+)
+
 func BenchmarkContentDispositionCurrentASCII(b *testing.B) {
 	benchmarkContentDisposition(b, "attachment", "report-2026-final.txt", dispo.ContentDisposition)
 }
@@ -129,43 +165,7 @@ func sanitizeFilenameReplace(name string) string {
 		return ""
 	}
 
-	replacer := strings.NewReplacer(
-		"\x00", "",
-		"\x01", "",
-		"\x02", "",
-		"\x03", "",
-		"\x04", "",
-		"\x05", "",
-		"\x06", "",
-		"\x07", "",
-		"\x08", "",
-		"\x09", " ",
-		"\x0a", " ",
-		"\x0b", " ",
-		"\x0c", " ",
-		"\x0d", " ",
-		"\x0e", "",
-		"\x0f", "",
-		"\x10", "",
-		"\x11", "",
-		"\x12", "",
-		"\x13", "",
-		"\x14", "",
-		"\x15", "",
-		"\x16", "",
-		"\x17", "",
-		"\x18", "",
-		"\x19", "",
-		"\x1a", "",
-		"\x1b", "",
-		"\x1c", "",
-		"\x1d", "",
-		"\x1e", "",
-		"\x1f", "",
-		"\x7f", "",
-	)
-
-	s := replacer.Replace(name)
+	s := filenameControlReplacer.Replace(name)
 	s = strings.Map(func(r rune) rune {
 		switch {
 		case unicode.IsControl(r):
